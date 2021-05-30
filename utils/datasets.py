@@ -7,6 +7,10 @@ import os
 import random
 import shutil
 import time
+import json
+import yaml
+import copy
+import traceback
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -21,7 +25,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
-    resample_segments, clean_str
+    resample_segments, clean_str, xywh2xywhn, coco2xywh
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -57,7 +61,7 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', image_anno_path = ''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -69,7 +73,8 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
+                                      prefix=prefix,
+                                      image_anno_path = image_anno_path)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -345,8 +350,12 @@ def img2label_paths(img_paths):
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+    def __init__(self, path,
+                 img_size=640, batch_size=16, augment=False, hyp=None, rect=False, 
+                 image_weights=False, cache_images=False, single_cls=False, 
+                 stride=32, pad=0.0, prefix='', 
+                 image_anno_path = ''):
+        
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -356,44 +365,34 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
+        
+        from od_toolbox.read_anno_coco import read_json
+        with open(image_anno_path, 'r') as json_dir:
+            image_annos = json.load(json_dir)
+            
+            #only for zalo data set :(
+            for i in range(len(image_annos['annotations'])):
+                image_annos['annotations'][i]['category_id'] -= 1
+
+        image_annos = read_json(image_annos)
 
         try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
+#             self.img_files = glob.glob('{}/*'.format(path))
+            self.img_files = [os.path.join(path, image_annos[image_id].file_name) for image_id in image_annos]
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
-        if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
-            if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
-        else:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
-
+        cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')  # cached labels
+        cache = self.cache_labels(path, image_annos, prefix)  # cache
+        self.cache = copy.deepcopy(cache)
+        
+        
         # Display cache
-        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
-        if exists:
-            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
+        number_found, number_missing, number_empty, number_duplicate, n = cache.pop('results')  # found, missing, empty, corrupted, total
+        assert number_found > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
 
         # Read cache
         cache.pop('hash')  # remove hash
@@ -451,15 +450,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
             pbar.close()
 
-    def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+#     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+    def cache_labels(self, path, image_annos, prefix=''):
+        
         # Cache dataset labels, check images and read shapes
         x = {}  # dict
-        nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
-        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
-        for i, (im_file, lb_file) in enumerate(pbar):
+        number_missing, number_found, number_empty, number_duplicate = 0, 0, 0, 0  # number missing, found, empty, duplicate
+        image_ids = list(image_annos.keys())
+        pbar = tqdm(zip(image_ids, self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
+        for i, (image_id, im_file, lb_file) in enumerate(pbar):
             try:
+                image_anno = image_annos[image_id]
                 # verify images
                 im = Image.open(im_file)
+                
                 im.verify()  # PIL verify
                 shape = exif_size(im)  # image size
                 segments = []  # instance segments
@@ -467,42 +471,32 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 assert im.format.lower() in img_formats, f'invalid image format {im.format}'
 
                 # verify labels
-                if os.path.isfile(lb_file):
-                    nf += 1  # label found
-                    with open(lb_file, 'r') as f:
-                        l = [x.split() for x in f.read().strip().splitlines()]
-                        if any([len(x) > 8 for x in l]):  # is segment
-                            classes = np.array([x[0] for x in l], dtype=np.float32)
-                            segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
-                            l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                        l = np.array(l, dtype=np.float32)
-                    if len(l):
-                        assert l.shape[1] == 5, 'labels require 5 columns each'
-                        assert (l >= 0).all(), 'negative labels'
-                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
-                    else:
-                        ne += 1  # label empty
-                        l = np.zeros((0, 5), dtype=np.float32)
+                if len(image_anno.annotations) > 0:
+                    number_found += 1  # label found
+                    l = [[anno['category_id']] + xywh2xywhn(coco2xywh(anno['bbox'])) for anno in image_anno.annotations]
+                    l = np.array(l, dtype=np.float32)
                 else:
-                    nm += 1  # label missing
+                    number_empty += 1  # label missing
                     l = np.zeros((0, 5), dtype=np.float32)
+                
                 x[im_file] = [l, shape, segments]
+                
             except Exception as e:
-                nc += 1
+                traceback.print_exc()
+                number_duplicate += 1
                 print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
 
-            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
-                        f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+            pbar.desc = f"{prefix}Scanning '{path}' images and labels... " \
+                        f"{number_found} found, {number_missing} missing, {number_empty} empty, {number_duplicate} corrupted"
         pbar.close()
 
-        if nf == 0:
+        if number_found == 0:
             print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
 
         x['hash'] = get_hash(self.label_files + self.img_files)
-        x['results'] = nf, nm, ne, nc, i + 1
+        x['results'] = number_found, number_missing, number_empty, number_duplicate, i + 1
         x['version'] = 0.1  # cache version
-        torch.save(x, path)  # save for next time
+#         torch.save(x, path)  # save for next time
         logging.info(f'{prefix}New cache created: {path}')
         return x
 
@@ -631,6 +625,7 @@ def load_image(self, index):
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
+        # print(path)
         img = cv2.imread(path)  # BGR
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
@@ -705,7 +700,7 @@ def load_mosaic(self, index):
             segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
         labels4.append(labels)
         segments4.extend(segments)
-
+    # print()
     # Concat/clip labels
     labels4 = np.concatenate(labels4, 0)
     for x in (labels4[:, 1:], *segments4):

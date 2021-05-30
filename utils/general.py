@@ -281,6 +281,14 @@ def xywhn2xyxy(x, w=640, h=640, padw=0, padh=0):
     y[:, 3] = h * (x[:, 1] + x[:, 3] / 2) + padh  # bottom right y
     return y
 
+def xywh2xywhn(x, h=626, w = 1622):
+    return [x[0]/w, x[1]/h, x[2]/w, x[3]/h]
+
+def coco2xywh(x):
+    # Convert nx4 boxes from [x_left, y_top, w, h] normalized to [x_center, y_center, w, h]
+    x[0] += x[2]//2
+    x[1] += x[3]//2
+    return x
 
 def xyn2xy(x, w=640, h=640, padw=0, padh=0):
     # Convert normalized segments into pixel segments, shape (n,2)
