@@ -24,6 +24,8 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+import albumentations as A
+
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
     resample_segments, clean_str, xywh2xywhn, coco2xywh
 from utils.torch_utils import torch_distributed_zero_first
@@ -395,8 +397,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         assert number_found > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
 
         # Read cache
-        cache.pop('hash')  # remove hash
-        cache.pop('version')  # remove version
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
@@ -440,17 +440,19 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
         if cache_images:
-            gb = 0  # Gigabytes of cached images
-            self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
-            pbar = tqdm(enumerate(results), total=n)
-            for i, x in pbar:
-                self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
-                gb += self.imgs[i].nbytes
-                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
-            pbar.close()
+            self.cache_images()
 
-#     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+    def cache_images(self):
+        gb = 0  # Gigabytes of cached images
+        self.img_hw0, self.img_hw = [None] * n, [None] * n
+        results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
+        pbar = tqdm(enumerate(results), total=n)
+        for i, x in pbar:
+            self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
+            gb += self.imgs[i].nbytes
+            pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
+        pbar.close()
+
     def cache_labels(self, path, image_annos, prefix=''):
         
         # Cache dataset labels, check images and read shapes
@@ -493,10 +495,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if number_found == 0:
             print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
 
-        x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = number_found, number_missing, number_empty, number_duplicate, i + 1
-        x['version'] = 0.1  # cache version
-#         torch.save(x, path)  # save for next time
         logging.info(f'{prefix}New cache created: {path}')
         return x
 
@@ -668,7 +667,8 @@ def load_mosaic(self, index):
 
     labels4, segments4 = [], []
     s = self.img_size
-    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    # yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    yc = xc = s # always in center image
     indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
@@ -676,7 +676,7 @@ def load_mosaic(self, index):
 
         # place img in img4
         if i == 0:  # top left
-            img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+            img4 = np.full((s * 2, s * 2, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
             x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
             x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
         elif i == 1:  # top right
@@ -707,6 +707,11 @@ def load_mosaic(self, index):
         np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
+    # random_int = random.randint(0,100)
+    # test_path = 'rework/test_{}.jpg'.format(random_int)
+    # # print()
+    # cv2.imwrite(test_path, img4)
+
     # Augment
     img4, labels4 = random_perspective(img4, labels4, segments4,
                                        degrees=self.hyp['degrees'],
@@ -715,6 +720,21 @@ def load_mosaic(self, index):
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
                                        border=self.mosaic_border)  # border to remove
+
+    # color = (255, 255, 255)
+    # thickness = 1
+
+    # for anno in labels4:
+    #     (class_, xmin, ymin, xmax, ymax) = anno
+
+    #     start_point = (int(xmin), int(ymin))
+    #     end_point = (int(xmax), int(ymax))
+        
+    #     #draw bounding box
+    #     img4 = cv2.rectangle(img4, start_point, end_point, color, thickness)
+        
+    # test_path = 'rework/test_aug_{}.jpg'.format(random_int)
+    # cv2.imwrite(test_path, img4)
 
     return img4, labels4
 
@@ -847,88 +867,63 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
                        border=(0, 0)):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
+    
+    height = img.shape[0] + border[0] *2
+    width = img.shape[1] + border[1] *2
 
-    height = img.shape[0] + border[0] * 2  # shape(h,w,c)
-    width = img.shape[1] + border[1] * 2
+    # print('random_perspective border {}'.format(border))
+    # print(targets)
 
-    # Center
-    C = np.eye(3)
-    C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
-    C[1, 2] = -img.shape[0] / 2  # y translation (pixels)
+    bbox = cv2.boundingRect(img[:,:,0]) # remove padding
+    x, y, w, h = bbox
+    h_image, w_image = h, w
+    
+    albu_transform  = A.Compose([
+        A.CenterCrop(max(height, h_image) ,max(width, w_image), p = 1),
+        A.RandomCrop (height=height, width=width,p=1),
+        A.OneOf([
+            A.GaussNoise(var_limit=(150.0, 200.0), mean=0, p=0.5),
+        ], p = 0.5),
+        A.RandomGamma(gamma_limit=(120, 120), p=0.5),
+        A.RandomBrightnessContrast(contrast_limit=0, brightness_limit=0.2, brightness_by_max=True, p=0.5),
+        A.Rotate(limit=10, p=0.5),
+        A.OneOf([
+            A.HorizontalFlip(p=0.5),
+            # A.VerticalFlip(p=0.5)
+        ], p = 0.5),
+    ], p=1.0,
+        bbox_params=A.BboxParams(
+            format='pascal_voc',
+            min_area=0,
+            min_visibility=0,
+            label_fields=['labels']
+        )
+    )
 
-    # Perspective
-    P = np.eye(3)
-    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
-    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
-
-    # Rotation and Scale
-    R = np.eye(3)
-    a = random.uniform(-degrees, degrees)
-    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1 + scale)
-    # s = 2 ** random.uniform(-scale, scale)
-    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
-
-    # Shear
-    S = np.eye(3)
-    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
-    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
-
-    # Translation
-    T = np.eye(3)
-    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
-    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
-
-    # Combined rotation matrix
-    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
-    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
-        if perspective:
-            img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
-        else:  # affine
-            img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
-
-    # Visualize
-    # import matplotlib.pyplot as plt
-    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
-    # ax[0].imshow(img[:, :, ::-1])  # base
-    # ax[1].imshow(img2[:, :, ::-1])  # warped
-
-    # Transform label coordinates
     n = len(targets)
     if n:
-        use_segments = any(x.any() for x in segments)
-        new = np.zeros((n, 4))
-        if use_segments:  # warp segments
-            segments = resample_segments(segments)  # upsample
-            for i, segment in enumerate(segments):
-                xy = np.ones((len(segment), 3))
-                xy[:, :2] = segment
-                xy = xy @ M.T  # transform
-                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
+        labels = targets[:,0]
+        bboxes = targets[:,1:]
+        # print('before', targets)
+        # print('before', bboxes)
+    else:
+        labels = []
+        bboxes = []
 
-                # clip
-                new[i] = segment2box(xy, width, height)
+    transformed = albu_transform(image=img, bboxes=bboxes, labels=labels)
+    img = transformed['image']
 
-        else:  # warp boxes
-            xy = np.ones((n * 4, 3))
-            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-            xy = xy @ M.T  # transform
-            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+    if n:
+        labels = transformed['labels']
+        bboxes = transformed['bboxes']
+        # print('after', bboxes)
+        
+        targets = np.zeros((len(labels), 5))
+        if len(labels) > 0:
+            targets[:,0] = labels
+            targets[:,1:] = bboxes
 
-            # create new boxes
-            x = xy[:, [0, 2, 4, 6]]
-            y = xy[:, [1, 3, 5, 7]]
-            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
-
-            # clip
-            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
-            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
-
-        # filter candidates
-        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
-        targets = targets[i]
-        targets[:, 1:5] = new[i]
-
+    # print('after augment {}'.format(targets))
     return img, targets
 
 
@@ -938,7 +933,6 @@ def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  #
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
     ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
     return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
-
 
 def cutout(image, labels):
     # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
