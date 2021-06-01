@@ -386,22 +386,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')  # cached labels
         cache = self.cache_labels(path, image_annos, prefix)  # cache
         self.cache = copy.deepcopy(cache)
         
-        
         # Display cache
         number_found, number_missing, number_empty, number_duplicate, n = cache.pop('results')  # found, missing, empty, corrupted, total
-        assert number_found > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
+        assert number_found > 0 or not augment, f'{prefix}No labels in {image_anno_path}. Can not train without labels. See {help_url}'
 
         # Read cache
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
         if single_cls:
             for x in self.labels:
                 x[:, 0] = 0
@@ -420,7 +416,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             irect = ar.argsort()
             self.img_files = [self.img_files[i] for i in irect]
-            self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.shapes = s[irect]  # wh
             ar = ar[irect]
@@ -459,8 +454,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         x = {}  # dict
         number_missing, number_found, number_empty, number_duplicate = 0, 0, 0, 0  # number missing, found, empty, duplicate
         image_ids = list(image_annos.keys())
-        pbar = tqdm(zip(image_ids, self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
-        for i, (image_id, im_file, lb_file) in enumerate(pbar):
+        pbar = tqdm(zip(image_ids, self.img_files), desc='Scanning images', total=len(self.img_files))
+        for i, (image_id, im_file) in enumerate(pbar):
             try:
                 image_anno = image_annos[image_id]
                 # verify images
